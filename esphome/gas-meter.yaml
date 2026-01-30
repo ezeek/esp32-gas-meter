@@ -4,7 +4,7 @@ esphome:
   on_boot:
     priority: 600
     then:
-      - logger.log: "BOOT: running placement firmware (1Hz logging enabled)"
+      - logger.log: "BOOT: gas meter firmware (adaptive voltage pulse detection)"
 
 esp32:
   board: esp32dev
@@ -24,9 +24,66 @@ wifi:
   password: !secret wifi_password
 
 # -----------------------
-# A1324 ANALOG (VOLTS)
+# STATE + STATS
 # -----------------------
+globals:
+  - id: v_min
+    type: float
+    restore_value: no
+    initial_value: "99.0"
+  - id: v_max
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+  # Adaptive detector state
+  - id: baseline
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+  - id: delta_est
+    type: float
+    restore_value: no
+    initial_value: "0.05"
+  - id: in_pulse
+    type: bool
+    restore_value: no
+    initial_value: "false"
+  - id: last_pulse_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: last_off_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+  - id: last_pulse_ms_for_period
+    type: uint32_t
+    restore_value: no
+    initial_value: "0"
+
+# ------------------------------------------------------------
+# TUNING KNOBS FROM HA (no recompiles needed)
+# ------------------------------------------------------------
 sensor:
+  - platform: homeassistant
+    id: ha_ft3_per_pulse
+    entity_id: number.gas_meter_gas_ft3_per_pulse
+    internal: true
+
+  - platform: homeassistant
+    id: ha_lockout_s
+    entity_id: number.gas_meter_gas_lockout_s
+    internal: true
+
+  - platform: homeassistant
+    id: ha_rearm_off_s
+    entity_id: number.gas_meter_gas_rearm_off_s
+    internal: true
+
+  # -----------------------
+  # A1324 ANALOG (VOLTS)
+  # -----------------------
   - platform: adc
     pin: GPIO34
     name: "A1324 Voltage"
@@ -54,10 +111,83 @@ sensor:
     accuracy_decimals: 4
     update_interval: never
 
+  # -----------------------
+  # EXISTING DOWNSTREAM ENTITIES (KEEP NAMES)
+  # -----------------------
+  - platform: template
+    name: "Gas Total Pulses"
+    id: gas_total_pulses
+    unit_of_measurement: "pulses"
+    accuracy_decimals: 0
+    update_interval: never
+    icon: "mdi:counter"
+
+  - platform: template
+    name: "Gas Total Volume"
+    id: gas_total_volume
+    unit_of_measurement: "ft³"
+    device_class: gas
+    state_class: total_increasing
+    accuracy_decimals: 2
+    update_interval: never
+
+  - platform: template
+    name: "Gas Pulse Period"
+    id: gas_pulse_period
+    unit_of_measurement: "s"
+    accuracy_decimals: 3
+    update_interval: never
+
+  - platform: template
+    name: "Gas Rate"
+    id: gas_rate
+    unit_of_measurement: "ft³/hr"
+    accuracy_decimals: 3
+    update_interval: never
+
+  - platform: template
+    name: "Seconds Since Last Pulse"
+    id: seconds_since_last_pulse
+    unit_of_measurement: "s"
+    accuracy_decimals: 3
+    update_interval: never
+
 # -----------------------
-# LM393 DIGITAL OUT
+# DEBUG SWITCH (existing HA entity: switch.gas_meter_gas_meter_debug)
+# -----------------------
+switch:
+  - platform: template
+    name: "Gas Meter Debug"
+    id: gas_meter_debug
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - logger.log: "DEBUG: ON"
+    turn_off_action:
+      - logger.log: "DEBUG: OFF"
+
+# -----------------------
+# RESET BUTTON (existing HA entity: button.gas_meter_reset_gas_totals)
+# -----------------------
+button:
+  - platform: template
+    name: "Reset Gas Totals"
+    id: reset_gas_totals
+    on_press:
+      - lambda: |-
+          id(gas_total_pulses).publish_state(0);
+          id(gas_total_volume).publish_state(0);
+          id(gas_pulse_period).publish_state(NAN);
+          id(gas_rate).publish_state(NAN);
+          id(seconds_since_last_pulse).publish_state(0);
+          id(last_pulse_ms_for_period) = 0;
+          id(last_pulse_ms) = 0;
+          id(last_off_ms) = millis();
+
+# -----------------------
+# BINARY SENSORS
 # -----------------------
 binary_sensor:
+  # LM393 DIGITAL OUT (keep for debug/backup)
   - platform: gpio
     pin:
       number: GPIO25
@@ -68,23 +198,161 @@ binary_sensor:
       - delayed_on: 30ms
       - delayed_off: 30ms
     on_press:
-      - logger.log: "LM393 DO: ON"
+      - if:
+          condition:
+            switch.is_on: gas_meter_debug
+          then:
+            - logger.log: "LM393 DO: ON"
     on_release:
-      - logger.log: "LM393 DO: OFF"
+      - if:
+          condition:
+            switch.is_on: gas_meter_debug
+          then:
+            - logger.log: "LM393 DO: OFF"
+
+  # Gas Pulse Re-armed (existing HA entity)
+  - platform: template
+    name: "Gas Pulse Re-armed"
+    id: gas_pulse_re_armed
+    lambda: |-
+      const uint32_t now = millis();
+      const float rearm_off_s =
+        (!isnan(id(ha_rearm_off_s).state) && id(ha_rearm_off_s).state >= 0.0f)
+          ? id(ha_rearm_off_s).state
+          : 6.0f;
+      const uint32_t REARM_OFF_MS = (uint32_t)(rearm_off_s * 1000.0f);
+      return (now - id(last_off_ms)) >= REARM_OFF_MS;
+
+  # Gas Magnet Detected (existing HA entity) - now adaptive voltage-based
+  - platform: template
+    name: "Gas Magnet Detected"
+    id: gas_magnet_detected
+    lambda: |-
+      const float v = id(a1324_v).state;
+      if (isnan(v)) return id(in_pulse);
+
+      const uint32_t now = millis();
+
+      // HA tunables (with fallbacks)
+      const float ft3_per_pulse =
+        (!isnan(id(ha_ft3_per_pulse).state) && id(ha_ft3_per_pulse).state > 0.0f)
+          ? id(ha_ft3_per_pulse).state
+          : 2.0f;
+      (void)ft3_per_pulse;
+
+      float lockout_s =
+        (!isnan(id(ha_lockout_s).state) && id(ha_lockout_s).state >= 0.0f)
+          ? id(ha_lockout_s).state
+          : 45.0f;
+
+      // Hard clamp (mirrors your HA bounds)
+      if (lockout_s < 5.0f) lockout_s = 5.0f;
+      if (lockout_s > 120.0f) lockout_s = 120.0f;
+
+      // Smart clamp: don't let lockout exceed 80% of last measured period
+      // (prevents accidental "guaranteed misses" if things speed up)
+      if (!isnan(id(gas_pulse_period).state) && id(gas_pulse_period).state > 0.0f) {
+        const float max_reasonable = 0.80f * id(gas_pulse_period).state;
+        if (lockout_s > max_reasonable) lockout_s = max_reasonable;
+      }
+
+      const float rearm_off_s =
+        (!isnan(id(ha_rearm_off_s).state) && id(ha_rearm_off_s).state >= 0.0f)
+          ? id(ha_rearm_off_s).state
+          : 6.0f;
+
+      const uint32_t LOCKOUT_MS   = (uint32_t)(lockout_s   * 1000.0f);
+      const uint32_t REARM_OFF_MS = (uint32_t)(rearm_off_s * 1000.0f);
+
+      // Adaptive learning rates
+      const float BASE_ALPHA  = 0.002f;  // baseline follows temperature drift slowly
+      const float DELTA_ALPHA = 0.020f;  // delta learns magnet excursion faster
+
+      // Hysteresis fractions of learned delta
+      const float ON_FRAC  = 0.55f;
+      const float OFF_FRAC = 0.25f;
+
+      // Initialize baseline on first real sample
+      if (id(baseline) <= 0.001f) id(baseline) = v;
+
+      const bool in_lockout = (now - id(last_pulse_ms)) < LOCKOUT_MS;
+
+      // Update baseline only when idle and not in lockout
+      if (!id(in_pulse) && !in_lockout) {
+        id(baseline) = (1.0f - BASE_ALPHA) * id(baseline) + BASE_ALPHA * v;
+      }
+
+      // Positive excursion
+      float d = v - id(baseline);
+      if (d < 0) d = 0;
+
+      // Learn delta from excursions (clamp spikes)
+      if (!in_lockout && d > 0.01f) {
+        if (d > 0.50f) d = 0.50f;
+        id(delta_est) = (1.0f - DELTA_ALPHA) * id(delta_est) + DELTA_ALPHA * d;
+        if (id(delta_est) < 0.02f) id(delta_est) = 0.02f;
+      }
+
+      const float on_th  = id(baseline) + ON_FRAC  * id(delta_est);
+      const float off_th = id(baseline) + OFF_FRAC * id(delta_est);
+
+      // State machine: allow new pulse only when rearmed + not in lockout
+      if (!id(in_pulse)) {
+        const bool rearmed = (now - id(last_off_ms)) >= REARM_OFF_MS;
+        if (!in_lockout && rearmed && v >= on_th) {
+          id(in_pulse) = true;
+          id(last_pulse_ms) = now;
+        }
+      } else {
+        if (v <= off_th) {
+          id(in_pulse) = false;
+          id(last_off_ms) = now;
+        }
+      }
+
+      return id(in_pulse);
+
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+
+    on_press:
+      - lambda: |-
+          // Increment pulses exactly once per detection
+          const float next = id(gas_total_pulses).state + 1.0f;
+          id(gas_total_pulses).publish_state(next);
+
+          const uint32_t now = millis();
+
+          // Period + rate (after the 2nd pulse)
+          if (id(last_pulse_ms_for_period) != 0) {
+            const float period_s = (now - id(last_pulse_ms_for_period)) / 1000.0f;
+            id(gas_pulse_period).publish_state(period_s);
+
+            const float ft3_per_pulse =
+              (!isnan(id(ha_ft3_per_pulse).state) && id(ha_ft3_per_pulse).state > 0.0f)
+                ? id(ha_ft3_per_pulse).state
+                : 2.0f;
+
+            if (period_s > 0.01f) {
+              id(gas_rate).publish_state((ft3_per_pulse / period_s) * 3600.0f);
+            }
+          }
+          id(last_pulse_ms_for_period) = now;
+
+          // Total volume
+          const float ft3_per_pulse =
+            (!isnan(id(ha_ft3_per_pulse).state) && id(ha_ft3_per_pulse).state > 0.0f)
+              ? id(ha_ft3_per_pulse).state
+              : 2.0f;
+          id(gas_total_volume).publish_state(next * ft3_per_pulse);
+
+          // Reset "seconds since" immediately on pulse
+          id(seconds_since_last_pulse).publish_state(0);
 
 # -----------------------
-# MIN/MAX TRACKING + 1Hz LOGGING
+# INTERVALS
 # -----------------------
-globals:
-  - id: v_min
-    type: float
-    restore_value: no
-    initial_value: "99.0"
-  - id: v_max
-    type: float
-    restore_value: no
-    initial_value: "0.0"
-
 interval:
   # Track min/max continuously (no log spam)
   - interval: 100ms
@@ -96,16 +364,34 @@ interval:
             if (v > id(v_max)) id(v_max) = v;
           }
 
-  # One clean line per second
+  # One line per second (only if debug switch is on)
   - interval: 1s
     then:
-      - logger.log:
-          format: "A1324=%.4f V (min=%.4f max=%.4f) DO=%s"
-          args:
-            - "id(a1324_v).state"
-            - "id(v_min)"
-            - "id(v_max)"
-            - "id(lm393_do).state ? \"ON\" : \"OFF\""
+      - lambda: |-
+          const uint32_t now = millis();
+          if (id(last_pulse_ms_for_period) == 0) {
+            // no pulses yet; count up
+            id(seconds_since_last_pulse).publish_state(id(seconds_since_last_pulse).state + 1.0f);
+          } else {
+            id(seconds_since_last_pulse).publish_state((now - id(last_pulse_ms_for_period)) / 1000.0f);
+          }
+
+      - if:
+          condition:
+            switch.is_on: gas_meter_debug
+          then:
+            - logger.log:
+                format: "A1324=%.4f V (min=%.4f max=%.4f) LM393_DO=%s MAG=%s pulses=%.0f base=%.4f d=%.4f lockout=%.1fs"
+                args:
+                  - "id(a1324_v).state"
+                  - "id(v_min)"
+                  - "id(v_max)"
+                  - "id(lm393_do).state ? \"ON\" : \"OFF\""
+                  - "id(gas_magnet_detected).state ? \"ON\" : \"OFF\""
+                  - "id(gas_total_pulses).state"
+                  - "id(baseline)"
+                  - "id(delta_est)"
+                  - "(!isnan(id(ha_lockout_s).state) ? id(ha_lockout_s).state : 45.0f)"
 
   # Publish min/max to HA once per minute and reset window
   - interval: 60s
