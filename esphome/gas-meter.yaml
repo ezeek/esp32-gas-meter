@@ -1,0 +1,117 @@
+esphome:
+  name: gas-meter
+  friendly_name: Gas Meter
+  on_boot:
+    priority: 600
+    then:
+      - logger.log: "BOOT: running placement firmware (1Hz logging enabled)"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+# -----------------------
+# A1324 ANALOG (VOLTS)
+# -----------------------
+sensor:
+  - platform: adc
+    pin: GPIO34
+    name: "A1324 Voltage"
+    id: a1324_v
+    attenuation: 12db
+    update_interval: 50ms
+    accuracy_decimals: 4
+    filters:
+      - sliding_window_moving_average:
+          window_size: 7
+          send_every: 1
+
+  # Published once per minute (rolling window), otherwise unchanged.
+  - platform: template
+    name: "A1324 Voltage Min (last 60s)"
+    id: a1324_min
+    unit_of_measurement: "V"
+    accuracy_decimals: 4
+    update_interval: never
+
+  - platform: template
+    name: "A1324 Voltage Max (last 60s)"
+    id: a1324_max
+    unit_of_measurement: "V"
+    accuracy_decimals: 4
+    update_interval: never
+
+# -----------------------
+# LM393 DIGITAL OUT
+# -----------------------
+binary_sensor:
+  - platform: gpio
+    pin:
+      number: GPIO25
+      mode: INPUT_PULLUP
+    name: "LM393 Digital Out"
+    id: lm393_do
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_press:
+      - logger.log: "LM393 DO: ON"
+    on_release:
+      - logger.log: "LM393 DO: OFF"
+
+# -----------------------
+# MIN/MAX TRACKING + 1Hz LOGGING
+# -----------------------
+globals:
+  - id: v_min
+    type: float
+    restore_value: no
+    initial_value: "99.0"
+  - id: v_max
+    type: float
+    restore_value: no
+    initial_value: "0.0"
+
+interval:
+  # Track min/max continuously (no log spam)
+  - interval: 100ms
+    then:
+      - lambda: |-
+          float v = id(a1324_v).state;
+          if (!isnan(v)) {
+            if (v < id(v_min)) id(v_min) = v;
+            if (v > id(v_max)) id(v_max) = v;
+          }
+
+  # One clean line per second
+  - interval: 1s
+    then:
+      - logger.log:
+          format: "A1324=%.4f V (min=%.4f max=%.4f) DO=%s"
+          args:
+            - "id(a1324_v).state"
+            - "id(v_min)"
+            - "id(v_max)"
+            - "id(lm393_do).state ? \"ON\" : \"OFF\""
+
+  # Publish min/max to HA once per minute and reset window
+  - interval: 60s
+    then:
+      - lambda: |-
+          id(a1324_min).publish_state(id(v_min));
+          id(a1324_max).publish_state(id(v_max));
+          id(v_min) = 99.0f;
+          id(v_max) = 0.0f;
