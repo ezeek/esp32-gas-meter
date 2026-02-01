@@ -324,12 +324,12 @@ sensor:
     name: "A1324 Voltage"
     id: a1324_v
     attenuation: 12db
-    update_interval: 50ms
+    update_interval: 100ms
     accuracy_decimals: 4
     filters:
       - sliding_window_moving_average:
-          window_size: 7
-          send_every: 1
+          window_size: 9
+          send_every: 3
 
   - platform: template
     name: "A1324 Voltage Min (last 60s)"
@@ -512,8 +512,22 @@ binary_sensor:
       if (isnan(LEARN_TH))    LEARN_TH = 0.010f;
       if (isnan(DELTA_ALPHA)) DELTA_ALPHA = 0.10f;
 
-      if (id(baseline) <= 0.001f) id(baseline) = v;
-
+      // --- BOOTSTRAP: if baseline isn't initialized, seed it and DON'T detect yet ---
+      if (id(baseline) <= 0.001f || isnan(id(baseline))) {
+        id(baseline) = v;
+      
+        // keep delta sane so thresholds don't collapse
+        if (id(delta_est) < DELTA_FLOOR) id(delta_est) = DELTA_FLOOR;
+      
+        // ensure we start "not in pulse"
+        id(in_pulse) = false;
+      
+        // treat as recently OFF so rearm logic behaves
+        id(last_off_ms) = now;
+      
+        return false;
+      }
+  
       const bool in_lockout = (now - id(last_pulse_ms)) < LOCKOUT_MS;
 
       // --- derive "seconds since last pulse" ---
@@ -562,7 +576,7 @@ binary_sensor:
         const bool rearmed_ok = (now - id(last_off_ms)) >= REARM_OFF_MS;
 
         // Delta trigger helps with slow ramps (keeps sensitivity even if baseline isn't moving)
-        const bool delta_trigger = (d >= (1.2f * DELTA_FLOOR));
+        const bool delta_trigger = (d >= (2.0f * DELTA_FLOOR));
 
         if (!in_lockout && rearmed_ok && (v >= on_th || delta_trigger)) {
           id(in_pulse) = true;
