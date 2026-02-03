@@ -266,6 +266,19 @@ number:
       - lambda: |-
           id(min_gap_between_pulses_s).publish_state(x);
 
+  - platform: template
+    name: "Gas Min OFF Stable (ms)"
+    id: min_off_stable_ms
+    min_value: 0
+    max_value: 5000
+    step: 50
+    optimistic: true
+    restore_value: true
+    initial_value: 500
+    set_action:
+      - lambda: |-
+          id(min_off_stable_ms).publish_state(x);
+
 # -----------------------
 # DEBUG SWITCH
 # -----------------------
@@ -575,13 +588,18 @@ binary_sensor:
       if (!id(in_pulse)) {
         const bool rearmed_ok = (now - id(last_off_ms)) >= REARM_OFF_MS;
 
-        // Delta trigger helps with slow ramps (keeps sensitivity even if baseline isn't moving)
-        const bool delta_trigger = (d >= (2.0f * DELTA_FLOOR));
+        float off_stable = id(min_off_stable_ms).state;
+        if (isnan(off_stable)) off_stable = 500.0f;
+        const uint32_t OFF_STABLE_MS = (uint32_t) off_stable;
+        const bool off_stable_ok = (now - id(last_off_ms)) >= OFF_STABLE_MS;
 
-        if (!in_lockout && rearmed_ok && (v >= on_th || delta_trigger)) {
+        // Delta trigger helps with slow ramps (keeps sensitivity even if baseline isn't moving)
+        const bool delta_trigger = (d >= (1.2f * DELTA_FLOOR)) && (d >= LEARN_TH);
+
+        if (!in_lockout && rearmed_ok && off_stable_ok && (v >= on_th || delta_trigger)) {
           id(in_pulse) = true;
           id(last_pulse_ms) = now;
-          id(pulse_on_ms) = now;   // record ON start for min pulse width seatbelt
+          id(pulse_on_ms) = now;   // record ON start for on_release seatbelt
         }
       } else {
         if (v <= off_th) {
